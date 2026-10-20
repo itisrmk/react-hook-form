@@ -668,6 +668,45 @@ describe('Form', () => {
       new Headers(fetchSpy.mock.calls[0][1]?.headers).has('content-type'),
     ).toBe(false);
   });
+
+  it.each([
+    'Multipart/Form-Data',
+    'MULTIPART/FORM-DATA',
+    'multipart/form-data; charset=UTF-8',
+    'multipart/form-data; boundary=custom',
+  ])(
+    'leave the multipart boundary to fetch for encType %s',
+    async (encType) => {
+      const fetchSpy = jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+      const App = () => {
+        const { register, control } = useForm({
+          defaultValues: { name: 'bill' },
+        });
+
+        return (
+          <Form action="/api" control={control} encType={encType}>
+            <input {...register('name')} />
+            <button>Submit</button>
+          </Form>
+        );
+      };
+
+      render(<App />);
+
+      fireEvent.click(screen.getByRole('button'));
+
+      await waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+
+      const init = fetchSpy.mock.calls[0][1];
+
+      expect(init?.body).toBeInstanceOf(FormData);
+      expect(new Headers(init?.headers).has('content-type')).toBe(false);
+    },
+  );
+
   it('not re-render Form when unrelated formState updates in FormProvider', () => {
     let formRenderCount = 0;
 
