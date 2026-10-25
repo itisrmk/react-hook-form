@@ -25,6 +25,238 @@ const Activity = (React as unknown as { Activity?: unknown })
 }>;
 const itWithActivity = Activity ? it : it.skip;
 
+type TrackedValues = {
+  watched: string;
+  second: string;
+  other: { deep: { marker: string } };
+  items: { name: string }[];
+};
+
+const trackedDefaultValues: TrackedValues = {
+  watched: 'kept',
+  second: 'also',
+  other: { deep: { marker: 'secret' } },
+  items: [{ name: 'first' }, { name: 'second' }],
+};
+
+type CloneHits = { hits: string[] };
+
+function describeValue(value: unknown) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
+}
+
+function nodeAt(root: unknown, path: string[]) {
+  let node = root as Record<string, unknown> | undefined;
+
+  for (let index = 0; index < path.length - 1; index++) {
+    const key = path[index];
+    const next = node?.[key];
+
+    if (!next || typeof next !== 'object') {
+      throw new Error(
+        `Expected ${path.join('.')} while trapping; stopped at ${path
+          .slice(0, index + 1)
+          .join('.')} in ${describeValue(root)}`,
+      );
+    }
+
+    node = next as Record<string, unknown>;
+  }
+
+  const key = path[path.length - 1];
+
+  if (!node || !Object.prototype.hasOwnProperty.call(node, key)) {
+    throw new Error(
+      `Expected ${path.join('.')} while trapping; found ${describeValue(root)}`,
+    );
+  }
+
+  return { node, key };
+}
+
+function trapCloneRead(
+  root: unknown,
+  path: string[],
+  hits: CloneHits,
+  label: string,
+) {
+  const { node, key } = nodeAt(root, path);
+  const current = node[key];
+
+  Object.defineProperty(node, key, {
+    enumerable: true,
+    configurable: true,
+    get() {
+      const stack = new Error().stack ?? '';
+
+      // useForm still deep-clones its own resync snapshot. Count only the
+      // useFormState snapshot, which is the per-Controller cost.
+      if (stack.includes('cloneFormStateForResync')) {
+        hits.hits.push(`${label}\n${stack.split('\n').slice(1, 8).join('\n')}`);
+      }
+
+      return current;
+    },
+  });
+}
+
+function prepareTrackedState(
+  control: Control<TrackedValues>,
+  setValue: (
+    name: 'watched' | 'second' | 'other.deep.marker' | 'items.1.name',
+    value: string,
+    options: { shouldDirty: true; shouldTouch: true },
+  ) => void,
+  setError: (
+    name: 'watched' | 'other.deep.marker',
+    error: { type: 'manual'; message: string },
+  ) => void,
+) {
+  setValue('watched', 'edited', { shouldDirty: true, shouldTouch: true });
+  setValue('second', 'edited', { shouldDirty: true, shouldTouch: true });
+  setValue('other.deep.marker', 'changed', {
+    shouldDirty: true,
+    shouldTouch: true,
+  });
+  setValue('items.1.name', 'edited', {
+    shouldDirty: true,
+    shouldTouch: true,
+  });
+  setError('watched', { type: 'manual', message: 'bad' });
+  setError('other.deep.marker', { type: 'manual', message: 'nope' });
+  control._formState.validatingFields = {
+    watched: true,
+    other: { deep: { marker: true } },
+  };
+}
+
+function installUnrelatedCloneTraps(
+  control: Control<TrackedValues>,
+  hits: CloneHits,
+) {
+  trapCloneRead(
+    control._defaultValues,
+    ['other', 'deep'],
+    hits,
+    'defaultValues.other.deep',
+  );
+  trapCloneRead(
+    control._defaultValues,
+    ['items', '1'],
+    hits,
+    'defaultValues.items.1',
+  );
+  trapCloneRead(
+    control._formState.dirtyFields,
+    ['other', 'deep', 'marker'],
+    hits,
+    'dirtyFields.other.deep.marker',
+  );
+  trapCloneRead(
+    control._formState.dirtyFields,
+    ['items', '1'],
+    hits,
+    'dirtyFields.items.1',
+  );
+  trapCloneRead(
+    control._formState.touchedFields,
+    ['other', 'deep', 'marker'],
+    hits,
+    'touchedFields.other.deep.marker',
+  );
+  trapCloneRead(
+    control._formState.errors,
+    ['other', 'deep', 'marker'],
+    hits,
+    'errors.other.deep.marker',
+  );
+  trapCloneRead(
+    control._formState.validatingFields,
+    ['other', 'deep', 'marker'],
+    hits,
+    'validatingFields.other.deep.marker',
+  );
+}
+
+function TrackedHarness({
+  show,
+  hits,
+  children,
+}: {
+  show: boolean;
+  hits: CloneHits;
+  children: (control: Control<TrackedValues>) => React.ReactNode;
+}) {
+  const { control, setValue, setError } = useForm<TrackedValues>({
+    defaultValues: trackedDefaultValues,
+  });
+  const hitsRef = React.useRef(hits);
+  const prepared = React.useRef(false);
+  const [ready, setReady] = React.useState(false);
+
+  hitsRef.current = hits;
+
+  React.useLayoutEffect(() => {
+    if (!prepared.current) {
+      prepared.current = true;
+      prepareTrackedState(control, setValue, setError);
+      installUnrelatedCloneTraps(control, hitsRef.current);
+    }
+
+    setReady(true);
+  }, [control, setError, setValue]);
+
+  if (!ready || !show) {
+    return null;
+  }
+
+  return <>{children(control)}</>;
+}
+
+function NamedSubscription({ control }: { control: Control<TrackedValues> }) {
+  useFormState({ control, name: ['watched', 'second'] });
+
+  return null;
+}
+
+function WholeFormSubscription({
+  control,
+}: {
+  control: Control<TrackedValues>;
+}) {
+  useFormState({ control });
+
+  return null;
+}
+
+function DisabledSubscription({
+  control,
+}: {
+  control: Control<TrackedValues>;
+}) {
+  useFormState({ control, disabled: true });
+
+  return null;
+}
+
+function NestedController({ control }: { control: Control<TrackedValues> }) {
+  return (
+    <Controller
+      control={control}
+      name="items.0.name"
+      render={({ field }) => <input {...field} value={field.value ?? ''} />}
+    />
+  );
+}
+
+function hitsFor(hits: CloneHits, prefix: string) {
+  return hits.hits.filter((hit) => hit.startsWith(prefix));
+}
+
 describe('useFormState', () => {
   it('render correct form state with isDirty, dirty, touched', async () => {
     let count = 0;
@@ -1115,6 +1347,183 @@ describe('useFormState', () => {
         expect(screen.getByTestId('error')).toHaveTextContent('no-error');
       },
     );
+
+    itWithActivity(
+      'should resync defaultValues after reset while an Activity subtree is hidden',
+      () => {
+        type FormValues = { name: string };
+
+        function Watcher({ control }: { control: Control<FormValues> }) {
+          const { defaultValues } = useFormState({ control });
+
+          return <span data-testid="default">{defaultValues?.name}</span>;
+        }
+
+        function Component() {
+          const { control, reset } = useForm<FormValues>({
+            defaultValues: { name: 'initial' },
+          });
+          const [mode, setMode] = React.useState<'hidden' | 'visible'>(
+            'visible',
+          );
+
+          return (
+            <>
+              <button type="button" onClick={() => setMode('hidden')}>
+                Hide
+              </button>
+              <button type="button" onClick={() => reset({ name: 'next' })}>
+                Reset
+              </button>
+              <button type="button" onClick={() => setMode('visible')}>
+                Show
+              </button>
+              <Activity mode={mode}>
+                <Watcher control={control} />
+              </Activity>
+            </>
+          );
+        }
+
+        render(
+          <React.StrictMode>
+            <Component />
+          </React.StrictMode>,
+        );
+
+        expect(screen.getByTestId('default')).toHaveTextContent('initial');
+
+        fireEvent.click(screen.getByRole('button', { name: 'Hide' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Show' }));
+
+        expect(screen.getByTestId('default')).toHaveTextContent('next');
+      },
+    );
+
+    itWithActivity(
+      'should resync a Controller and skip unrelated form state while hidden',
+      () => {
+        const hits: CloneHits = { hits: [] };
+
+        function ActivityField({
+          control,
+        }: {
+          control: Control<TrackedValues>;
+        }) {
+          return (
+            <Controller
+              control={control}
+              name="watched"
+              render={({ field, fieldState }) => (
+                <>
+                  <input {...field} />
+                  <span data-testid="dirty">
+                    {fieldState.isDirty ? 'dirty' : 'pristine'}
+                  </span>
+                  <span data-testid="error">
+                    {fieldState.error?.message || 'no-error'}
+                  </span>
+                </>
+              )}
+            />
+          );
+        }
+
+        function Component() {
+          const { control, setValue, setError, clearErrors } =
+            useForm<TrackedValues>({
+              defaultValues: trackedDefaultValues,
+            });
+          const [mode, setMode] = React.useState<'hidden' | 'visible' | null>(
+            null,
+          );
+          const prepared = React.useRef(false);
+
+          React.useLayoutEffect(() => {
+            if (prepared.current) {
+              return;
+            }
+
+            prepared.current = true;
+            setValue('watched', 'edited', {
+              shouldDirty: true,
+              shouldTouch: true,
+            });
+            setValue('other.deep.marker', 'changed', {
+              shouldDirty: true,
+              shouldTouch: true,
+            });
+            setValue('items.1.name', 'edited', {
+              shouldDirty: true,
+              shouldTouch: true,
+            });
+            setError('watched', { type: 'manual', message: 'bad' });
+            setError('other.deep.marker', {
+              type: 'manual',
+              message: 'nope',
+            });
+            control._formState.validatingFields = {
+              watched: true,
+              other: { deep: { marker: true } },
+            };
+            installUnrelatedCloneTraps(control, hits);
+            setMode('visible');
+          }, [control, setError, setValue]);
+
+          return (
+            <>
+              <button
+                type="button"
+                onClick={() =>
+                  setValue('watched', trackedDefaultValues.watched, {
+                    shouldDirty: true,
+                  })
+                }
+              >
+                Revert
+              </button>
+              <button type="button" onClick={() => clearErrors('watched')}>
+                Clear
+              </button>
+              <button type="button" onClick={() => setMode('hidden')}>
+                Hide
+              </button>
+              <button type="button" onClick={() => setMode('visible')}>
+                Show
+              </button>
+              {mode && (
+                <Activity mode={mode}>
+                  <ActivityField control={control} />
+                </Activity>
+              )}
+            </>
+          );
+        }
+
+        render(
+          <React.StrictMode>
+            <Component />
+          </React.StrictMode>,
+        );
+
+        expect(screen.getByTestId('dirty')).toHaveTextContent('dirty');
+        expect(screen.getByTestId('error')).toHaveTextContent('bad');
+        expect(hits.hits).toEqual([]);
+
+        fireEvent.click(screen.getByRole('button', { name: 'Hide' }));
+
+        expect(hits.hits).toEqual([]);
+
+        fireEvent.click(screen.getByRole('button', { name: 'Revert' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Show' }));
+
+        expect(screen.getByTestId('dirty')).toHaveTextContent('pristine');
+        expect(screen.getByTestId('error')).toHaveTextContent('no-error');
+        expect(hits.hits).toEqual([]);
+      },
+    );
   });
 
   it('should report isReady once the form has mounted', () => {
@@ -1133,5 +1542,143 @@ describe('useFormState', () => {
     render(<App />);
 
     expect(screen.getByText('ready')).toBeVisible();
+  });
+
+  it('does not deep-clone defaultValues or unrelated field trees for a named subscription', () => {
+    const hits: CloneHits = { hits: [] };
+    const { rerender } = render(
+      <TrackedHarness show={false} hits={hits}>
+        {(control) => <NamedSubscription control={control} />}
+      </TrackedHarness>,
+    );
+
+    expect(hits.hits).toEqual([]);
+
+    rerender(
+      <TrackedHarness show hits={hits}>
+        {(control) => <NamedSubscription control={control} />}
+      </TrackedHarness>,
+    );
+
+    expect(hits.hits).toEqual([]);
+
+    rerender(
+      <TrackedHarness show={false} hits={hits}>
+        {(control) => <NamedSubscription control={control} />}
+      </TrackedHarness>,
+    );
+
+    expect(hits.hits).toEqual([]);
+  });
+
+  it('does not deep-clone defaultValues or unrelated field trees when a Controller mounts and unmounts', () => {
+    const hits: CloneHits = { hits: [] };
+    const { rerender } = render(
+      <TrackedHarness show={false} hits={hits}>
+        {(control) => <NestedController control={control} />}
+      </TrackedHarness>,
+    );
+
+    rerender(
+      <TrackedHarness show hits={hits}>
+        {(control) => <NestedController control={control} />}
+      </TrackedHarness>,
+    );
+
+    expect(hits.hits).toEqual([]);
+
+    rerender(
+      <TrackedHarness show={false} hits={hits}>
+        {(control) => <NestedController control={control} />}
+      </TrackedHarness>,
+    );
+
+    expect(hits.hits).toEqual([]);
+  });
+
+  it('does not deep-clone form state when a disabled subscription mounts and unmounts', () => {
+    const hits: CloneHits = { hits: [] };
+    const { rerender } = render(
+      <TrackedHarness show={false} hits={hits}>
+        {(control) => <DisabledSubscription control={control} />}
+      </TrackedHarness>,
+    );
+
+    rerender(
+      <TrackedHarness show hits={hits}>
+        {(control) => <DisabledSubscription control={control} />}
+      </TrackedHarness>,
+    );
+    rerender(
+      <TrackedHarness show={false} hits={hits}>
+        {(control) => <DisabledSubscription control={control} />}
+      </TrackedHarness>,
+    );
+
+    expect(hits.hits).toEqual([]);
+  });
+
+  it('does not deep-clone defaultValues when useFormState subscribes to the whole form', () => {
+    const hits: CloneHits = { hits: [] };
+    const { rerender } = render(
+      <TrackedHarness show={false} hits={hits}>
+        {(control) => <WholeFormSubscription control={control} />}
+      </TrackedHarness>,
+    );
+
+    rerender(
+      <TrackedHarness show hits={hits}>
+        {(control) => <WholeFormSubscription control={control} />}
+      </TrackedHarness>,
+    );
+    rerender(
+      <TrackedHarness show={false} hits={hits}>
+        {(control) => <WholeFormSubscription control={control} />}
+      </TrackedHarness>,
+    );
+
+    expect(hitsFor(hits, 'defaultValues')).toEqual([]);
+    expect(hitsFor(hits, 'dirtyFields').length).toBeGreaterThan(0);
+  });
+
+  it('applies form state that changed while the subscription was disabled', () => {
+    type FormValues = { test: string };
+
+    function Child({ control }: { control: Control<FormValues> }) {
+      const [disabled, setDisabled] = React.useState(true);
+      const { errors } = useFormState({ control, disabled, name: 'test' });
+
+      return (
+        <div>
+          <p>{errors.test ? 'error' : 'ok'}</p>
+          <button onClick={() => setDisabled(false)}>enable</button>
+        </div>
+      );
+    }
+
+    function App() {
+      const { control, setError } = useForm<FormValues>();
+
+      return (
+        <div>
+          <Child control={control} />
+          <button
+            onClick={() => setError('test', { type: 'manual', message: 'bad' })}
+          >
+            set error
+          </button>
+        </div>
+      );
+    }
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'set error' }));
+
+    expect(screen.getByText('ok')).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: 'enable' }));
+
+    expect(screen.getByText('error')).toBeVisible();
   });
 });

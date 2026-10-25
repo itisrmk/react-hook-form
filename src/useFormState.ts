@@ -1,6 +1,11 @@
 import React from 'react';
 
 import getProxyFormState from './logic/getProxyFormState';
+import cloneObject from './utils/cloneObject';
+import deepEqual from './utils/deepEqual';
+import get from './utils/get';
+import isUndefined from './utils/isUndefined';
+import set from './utils/set';
 import type {
   FieldValues,
   FormState,
@@ -53,12 +58,52 @@ export function useFormState<
     isValid: false,
     errors: false,
   });
+  const _formStateRef = React.useRef(formState);
+  const _wasDisabled = React.useRef(!!disabled);
 
-  const { resyncIfNeeded, snapshot } =
-    useResyncOnReconnect<FormState<TFieldValues>>(getCurrentFormState);
+  _formStateRef.current = formState;
+
+  // `reset()` replaces `control._defaultValues`, so the resync snapshot keeps
+  // that reference instead of deep-cloning the whole form. With `name` (every
+  // Controller), only those field-map branches are cloned (#13944).
+  const getResyncFormState = (): FormState<TFieldValues> => {
+    const formState = getCurrentFormState();
+    const names = getFieldNames(name);
+
+    if (!names) {
+      return formState;
+    }
+
+    return {
+      ...formState,
+      errors: scopeFieldMap(formState.errors, names),
+      dirtyFields: scopeFieldMap(formState.dirtyFields, names),
+      touchedFields: scopeFieldMap(formState.touchedFields, names),
+      validatingFields: scopeFieldMap(formState.validatingFields, names),
+    };
+  };
+
+  const { resyncIfNeeded, snapshot } = useResyncOnReconnect(
+    disabled ? undefined : getResyncFormState,
+    cloneFormStateForResync,
+  );
 
   useIsomorphicLayoutEffect(() => {
-    resyncIfNeeded(!disabled, getCurrentFormState, updateFormState);
+    // A disabled subscription never seeds a snapshot. Catch up once it turns
+    // back on, which is what that seed used to make possible.
+    if (!disabled && _wasDisabled.current) {
+      const currentFormState = getCurrentFormState();
+
+      if (!deepEqual(_formStateRef.current, currentFormState)) {
+        updateFormState(currentFormState);
+      }
+    }
+
+    _wasDisabled.current = !!disabled;
+
+    resyncIfNeeded(!disabled, getResyncFormState, () => {
+      updateFormState(getCurrentFormState());
+    });
 
     const unsubscribe = control._subscribe({
       name,
@@ -77,7 +122,7 @@ export function useFormState<
 
     return () => {
       unsubscribe();
-      snapshot(!disabled, getCurrentFormState);
+      snapshot(!disabled, getResyncFormState);
     };
   }, [control, name, disabled, exact, resyncIfNeeded, snapshot]);
 
@@ -95,4 +140,43 @@ export function useFormState<
       ),
     [formState, control],
   );
+}
+
+function getFieldNames(
+  name: UseFormStateProps<FieldValues>['name'],
+): readonly string[] | undefined {
+  if (name == null) {
+    return undefined;
+  }
+
+  return (Array.isArray(name) ? name : [name]) as readonly string[];
+}
+
+function scopeFieldMap<T>(fieldMap: T, names: readonly string[]): T {
+  const scoped: Record<string, unknown> = {};
+
+  for (const fieldName of names) {
+    const value = get(fieldMap, fieldName);
+
+    if (!isUndefined(value)) {
+      // Copy the branch so a later `set` for a child path cannot write
+      // through to the live field map.
+      set(scoped, fieldName, cloneObject(value));
+    }
+  }
+
+  return scoped as T;
+}
+
+function cloneFormStateForResync<TFieldValues extends FieldValues>(
+  formState: FormState<TFieldValues>,
+): FormState<TFieldValues> {
+  return {
+    ...formState,
+    errors: cloneObject(formState.errors),
+    dirtyFields: cloneObject(formState.dirtyFields),
+    touchedFields: cloneObject(formState.touchedFields),
+    validatingFields: cloneObject(formState.validatingFields),
+    defaultValues: formState.defaultValues,
+  };
 }
